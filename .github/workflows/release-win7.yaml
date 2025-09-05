@@ -1,0 +1,199 @@
+name: Release (Windows 7 Targets)
+
+on:
+  workflow_dispatch:
+    inputs:
+      toolchain_version:
+        description: 'Specify a Rust toolchain (e.g., nightly-2024-05-10). Leave as "nightly" for the latest.'
+        required: true
+        type: string
+        default: 'nightly'
+
+jobs:
+  build-win7:
+    name: Build for ${{ matrix.target }}
+    permissions:
+      contents: read
+
+    strategy:
+      matrix:
+        include:
+        - target: x86_64-win7-windows-msvc
+          os: windows-latest
+          cargo-flags: "-Z build-std=panic_abort,std"
+        - target: i686-win7-windows-msvc
+          os: windows-latest
+          cargo-flags: "-Z build-std=panic_abort,std"
+
+    runs-on: ${{matrix.os}}
+    env:
+      BUILD_CMD: cargo
+
+    outputs:
+      toolchain_version: ${{ steps.get_toolchain_version.outputs.toolchain_version }}
+
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: 'upstream-main'
+
+    - name: Get version from Cargo.toml
+      id: get_version
+      shell: bash
+      run: |
+        version=$(grep '^version =' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+        echo "version=$version" >> $GITHUB_OUTPUT
+
+    - name: Install Rust Toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        # targets: ${{ matrix.target }}
+        toolchain: ${{ github.event.inputs.toolchain_version }}
+        components: rust-src
+
+    - name: Show Version Information (Rust, cargo, GCC)
+      shell: bash
+      run: |
+        gcc --version || true
+        rustup -V
+        rustup toolchain list
+        rustup default
+        cargo -V
+        rustc -V
+
+    - name: Get Toolchain Version Info
+      id: get_toolchain_version
+      shell: bash
+      run: |
+        TOOLCHAIN_INPUT="${{ github.event.inputs.toolchain_version }}"
+        TOOLCHAIN_VERSION=""
+        if [[ "$TOOLCHAIN_INPUT" == "nightly" ]]; then
+          # Get the date from `rustc -V` output
+          rustc_output=$(rustc -V)
+          actual_date=$(echo "$rustc_output" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
+          if [[ -n "$actual_date" ]]; then
+            # Add one day to the date (nightly versions are released for the *next* day)
+            release_date=$(date -d "$actual_date + 1 day" +%Y-%m-%d)
+            TOOLCHAIN_VERSION="nightly-$release_date"
+          else
+            TOOLCHAIN_VERSION="$TOOLCHAIN_INPUT"
+            echo "::warning::Could not extract date from 'rustc -V' for nightly toolchain. Using input value directly."
+          fi
+        else
+          # If not "nightly", use the exact input toolchain version
+          TOOLCHAIN_VERSION="$TOOLCHAIN_INPUT"
+        fi
+        echo "toolchain_version=$TOOLCHAIN_VERSION" >> $GITHUB_OUTPUT
+        echo "Actual toolchain version used: $TOOLCHAIN_VERSION"
+
+    - name: Build
+      shell: bash
+      run: $BUILD_CMD build --locked --release --target ${{ matrix.target }} ${{ matrix.cargo-flags }}
+
+    - name: Build Archive
+      shell: bash
+      id: package
+      env:
+        target: ${{ matrix.target }}
+        version: ${{ steps.get_version.outputs.version }}
+      run: |
+        set -euxo pipefail
+
+        bin=$(grep '^name =' Cargo.toml | sed 's/name = "\(.*\)"/\1/')
+        dist_dir=`pwd`/dist
+        name=$bin-$version-$target
+        executable=target/$target/release/$bin
+
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          executable=$executable.exe
+        fi
+
+        mkdir $dist_dir
+        cp $executable $dist_dir
+        cd $dist_dir
+
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+            archive=$dist_dir/$name.zip
+            7z a $archive *
+            echo "archive=dist/$name.zip" >> $GITHUB_OUTPUT
+        else
+            archive=$dist_dir/$name.tar.gz
+            tar -czf $archive *
+            echo "archive=dist/$name.tar.gz" >> $GITHUB_OUTPUT
+        fi
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: build-asset-${{ matrix.target }}
+        path: ${{ steps.package.outputs.archive }}
+
+  release:
+    name: Publish to Github Releases
+    needs: build-win7
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: 'upstream-main'
+
+      - name: Get commit info
+        id: get_commit_info
+        run: |
+          echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "full_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "commit_time=$(git show -s --format=%cd --date=format:%Y.%m.%d-%H%M%S HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Get version from Cargo.toml
+        id: get_version
+        shell: bash
+        run: |
+          version=$(grep '^version =' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Update dev-win7-latest tag
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          # Delete the old tag locally and remotely
+          git tag -d dev-win7-latest || true
+          git push origin --delete dev-win7-latest || true
+          # Create and push the new tag at the current commit
+          git tag dev-win7-latest
+          git push origin dev-win7-latest
+
+      - name: Delete existing release (if any)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view dev-win7-latest > /dev/null 2>&1; then
+            echo "Existing release 'dev-win7-latest' found. Deleting it..."
+            gh release delete dev-win7-latest --yes
+          else
+            echo "No existing release 'dev-win7-latest' found. Skipping deletion."
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Display downloaded files
+        run: ls -R release-assets
+
+      - name: Publish Archives
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-win7-latest
+          name: Development Build v${{ steps.get_version.outputs.version }} for Windows 7
+          body: |
+            This is an automated build from the `upstream-main` branch with Rust toolchain `${{ needs.build-win7.outputs.toolchain_version }}`.
+            **Use with caution for production.**
+
+            Commit: [`${{ steps.get_commit_info.outputs.short_sha }}`](https://github.com/${{ github.repository }}/commit/${{ steps.get_commit_info.outputs.full_sha }})
+            Committed: ${{ steps.get_commit_info.outputs.commit_time }}
+            Version from Cargo.toml: `${{ steps.get_version.outputs.version }}`
+          draft: false
+          prerelease: true
+          files: release-assets/**/*
