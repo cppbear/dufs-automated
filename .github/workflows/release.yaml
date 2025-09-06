@@ -237,7 +237,6 @@ jobs:
             This is an automated build from the `upstream-main` branch.
             **Use with caution for production.**
 
-            Commit: [`${{ steps.get_commit_info.outputs.short_sha }}`](https://github.com/${{ github.repository }}/commit/${{ steps.get_commit_info.outputs.full_sha }})
             Committed: ${{ steps.get_commit_info.outputs.commit_time }}
             Version from Cargo.toml: `${{ steps.get_version.outputs.version }}`
           draft: false
